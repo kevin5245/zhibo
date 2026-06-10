@@ -1,23 +1,38 @@
 <?php
 /*
-  职球圈全量中转 PHP 统一矩阵（香港服务器直连版）
-  使用方法：
-  - 获取 M3U 订阅：http://你的香港服务器IP或域名/live.php?action=m3u
-  - 获取 TXT 订阅：http://你的香港服务器IP或域名/live.php?action=txt
+  职球圈全量中转 PHP 统一矩阵（云端部署版）
+  - 支持 HTTPS 自动识别 (适配 Render/Vercel)
+  - 自动构建 M3U/TXT 订阅
+  - TS 流式中转代理
 */
 
 define('BROWSER_UA', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
 // ==========================================
-// 1. 核心网络请求函数（使用香港本地网络直连）
+// 1. 工具函数：获取当前的基础 URL（处理 HTTPS 协议）
+// ==========================================
+function get_base_url() {
+    $protocol = 'http';
+    // 识别本地 HTTPS 或负载均衡器转发的 HTTPS 标头
+    if ((!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || 
+        (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')) {
+        $protocol = 'https';
+    }
+    $host = $_SERVER['HTTP_HOST'];
+    $script = explode('?', $_SERVER['REQUEST_URI'])[0];
+    return $protocol . "://" . $host . $script;
+}
+
+// ==========================================
+// 2. 核心网络请求函数
 // ==========================================
 function http_request($url, $method = 'GET', $body = null, $custom_headers = [], $is_ts_stream = false) {
     $ch = curl_init($url);
     $options = [
         CURLOPT_RETURNTRANSFER => !$is_ts_stream,
         CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_CONNECTTIMEOUT => 8,
-        CURLOPT_TIMEOUT        => $is_ts_stream ? 0 : 15, // 视频流不设超时
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT        => $is_ts_stream ? 0 : 20, // 视频流不设超时
         CURLOPT_USERAGENT      => BROWSER_UA,
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_SSL_VERIFYHOST => false,
@@ -32,7 +47,7 @@ function http_request($url, $method = 'GET', $body = null, $custom_headers = [],
         $options[CURLOPT_HTTPHEADER] = $custom_headers;
     }
 
-    // 针对 TS 视频切片进行流式泵送：服务器边下载边吐给国内播放器，不占内存
+    // 针对 TS 视频切片进行流式泵送
     if ($is_ts_stream) {
         $options[CURLOPT_WRITEFUNCTION] = function($ch, $data) {
             echo $data;
@@ -44,21 +59,23 @@ function http_request($url, $method = 'GET', $body = null, $custom_headers = [],
 
     curl_setopt_array($ch, $options);
     $response = curl_exec($ch);
+    $error = curl_error($ch);
     curl_close($ch);
 
-    return [$response];
+    return [$response, $error];
 }
 
 // ==========================================
-// 2. 业务路由核心
+// 3. 业务逻辑路由
 // ==========================================
 $action = $_GET['action'] ?? '';
+$current_url = get_base_url();
 
 try {
     switch ($action) {
+        // --- 获取订阅列表 ---
         case 'm3u':
         case 'txt':
-            // 1. 抓取赛事列表
             list($json_data) = http_request("https://api.sportlive.cc/data/events.json");
             $events = json_decode($json_data, true);
             $streams = [];
@@ -78,11 +95,6 @@ try {
                 }
             }
 
-            // 动态获取当前脚本的绝对 URL
-            $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https" : "http";
-            $current_url = $protocol . "://" . $_SERVER['HTTP_HOST'] . explode('?', $_SERVER['REQUEST_URI'])[0];
-
-            // 2. 输出订阅格式
             if ($action === 'm3u') {
                 header('Content-Type: application/vnd.apple.mpegurl; charset=utf-8');
                 echo "#EXTM3U\n";
@@ -98,11 +110,12 @@ try {
             }
             break;
 
+        // --- 播放解析重定向 ---
         case 'play':
             $id = $_GET['id'] ?? '';
-            if (empty($id)) die("缺少 ID");
+            if (empty($id)) die("Missing ID");
 
-            // 向上游动态解析接口索要真实地址（此时发出请求的是香港 IP，CF 不会拦截）
+            // 请求上游接口获取真实 m3u8 地址
             list($api_res) = http_request("https://data.stnye.cc/data/stream.php", "POST", "id=" . urlencode($id), [
                 'Content-Type: application/x-www-form-urlencoded'
             ]);
@@ -110,17 +123,15 @@ try {
 
             if (($res_arr['status'] ?? '') !== 'success' || empty($res_arr['content'])) {
                 http_response_code(502);
-                die("上游解析流失败");
+                die("Upstream parsing failed");
             }
 
             $real_m3u8_url = str_replace('\/', '/', $res_arr['content']);
             list($m3u8_content) = http_request($real_m3u8_url);
 
-            // 重写 M3U8 文本，把里面的 TS 切片全部强制代理回你的香港 PHP 接口
+            // 重写 m3u8 内容
             $lines = explode("\n", str_replace(["\r\n", "\r"], "\n", $m3u8_content));
-            $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https" : "http";
-            $current_url = $protocol . "://" . $_SERVER['HTTP_HOST'] . explode('?', $_SERVER['REQUEST_URI'])[0];
-
+            
             header('Content-Type: application/vnd.apple.mpegurl; charset=utf-8');
             header('Access-Control-Allow-Origin: *');
             header('Cache-Control: no-store');
@@ -131,33 +142,37 @@ try {
                 if (strpos($trim_line, '#') === 0) {
                     echo $line . "\n";
                 } else {
-                    // 补全 TS 的绝对路径，并套上当前的 PHP 代理壳子
+                    // 补全 TS 路径并代理
                     $ts_absolute_url = (strpos($trim_line, 'http') === 0) ? $trim_line : dirname($real_m3u8_url) . '/' . $trim_line;
                     echo $current_url . "?action=ts&tsurl=" . urlencode($ts_absolute_url) . "\n";
                 }
             }
             break;
 
+        // --- TS 切片代理泵送 ---
         case 'ts':
             $ts_url = $_GET['tsurl'] ?? '';
-            if (empty($ts_url)) die("缺少视频切片参数");
+            if (empty($ts_url)) die("Missing TS URL");
 
             header('Content-Type: video/MP2T');
             header('Access-Control-Allow-Origin: *');
             header('Cache-Control: public, max-age=3600');
 
-            // 关键：香港服务器代替国内播放器去下载视频流，并实时喂给国内的播放器
+            // 实时流式转发
             http_request($ts_url, 'GET', null, [
                 'Referer: https://elive.mayizhibo.net/'
             ], true);
             break;
 
         default:
-            http_response_code(404);
-            echo "IPTV 代理矩阵已就绪。请使用 ?action=m3u 或 ?action=txt 获取订阅。";
+            http_response_code(200);
+            header('Content-Type: text/html; charset=utf-8');
+            echo "<h2>IPTV 代理矩阵已就绪</h2>";
+            echo "<li>M3U 订阅: <a href='{$current_url}?action=m3u'>{$current_url}?action=m3u</a></li>";
+            echo "<li>TXT 订阅: <a href='{$current_url}?action=txt'>{$current_url}?action=txt</a></li>";
             break;
     }
 } catch (Exception $e) {
     http_response_code(500);
-    echo "发生错误: " . $e->getMessage();
+    echo "Error: " . $e->getMessage();
 }
